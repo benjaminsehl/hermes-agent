@@ -58,3 +58,69 @@ class TestBlueBubblesHelpers:
     def test_init_normalizes_webhook_path(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_path='bluebubbles-webhook')
         assert adapter.webhook_path == '/bluebubbles-webhook'
+
+    def test_webhook_prefers_chat_guid_over_message_guid(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        payload = {
+            'guid': 'MESSAGE-GUID',
+            'chatGuid': 'iMessage;-;ben@sehl.ca',
+            'chatIdentifier': 'ben@sehl.ca',
+        }
+        record = adapter._extract_payload_record(payload) or {}
+        chat_guid = adapter._value(
+            record.get('chatGuid'),
+            payload.get('chatGuid'),
+            record.get('chat_guid'),
+            payload.get('chat_guid'),
+            payload.get('guid'),
+        )
+        assert chat_guid == 'iMessage;-;ben@sehl.ca'
+
+    def test_webhook_can_fall_back_to_sender_when_chat_fields_missing(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        payload = {
+            'data': {
+                'guid': 'MESSAGE-GUID',
+                'text': 'hello',
+                'handle': {'address': 'ben@sehl.ca'},
+                'isFromMe': False,
+            }
+        }
+        record = adapter._extract_payload_record(payload) or {}
+        chat_guid = adapter._value(
+            record.get('chatGuid'),
+            payload.get('chatGuid'),
+            record.get('chat_guid'),
+            payload.get('chat_guid'),
+            payload.get('guid'),
+        )
+        chat_identifier = adapter._value(
+            record.get('chatIdentifier'),
+            record.get('identifier'),
+            payload.get('chatIdentifier'),
+            payload.get('identifier'),
+        )
+        sender = adapter._value(
+            record.get('handle', {}).get('address') if isinstance(record.get('handle'), dict) else None,
+            record.get('sender'),
+            record.get('from'),
+            record.get('address'),
+        ) or chat_identifier or chat_guid
+        if not (chat_guid or chat_identifier) and sender:
+            chat_identifier = sender
+        assert chat_identifier == 'ben@sehl.ca'
+
+    def test_extract_payload_record_accepts_list_data(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        payload = {
+            'type': 'new-message',
+            'data': [
+                {
+                    'text': 'hello',
+                    'chatGuid': 'iMessage;-;ben@sehl.ca',
+                    'chatIdentifier': 'ben@sehl.ca',
+                }
+            ],
+        }
+        record = adapter._extract_payload_record(payload)
+        assert record == payload['data'][0]

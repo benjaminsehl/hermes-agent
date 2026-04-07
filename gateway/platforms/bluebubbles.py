@@ -75,6 +75,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self.client: Optional[httpx.AsyncClient] = None
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
+        self._helper_connected: bool = False
 
     def _api_url(self, path: str) -> str:
         sep = '&' if '?' in path else '?'
@@ -101,8 +102,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         try:
             probe = await self._api_get('/api/v1/ping')
             info = await self._api_get('/api/v1/server/info')
-            self._private_api_enabled = bool((info or {}).get('data', {}).get('private_api'))
-            logger.info("[bluebubbles] connected to %s (private_api=%s)", self.server_url, self._private_api_enabled)
+            server_data = (info or {}).get('data', {})
+            self._private_api_enabled = bool(server_data.get('private_api'))
+            self._helper_connected = bool(server_data.get('helper_connected'))
+            logger.info("[bluebubbles] connected to %s (private_api=%s, helper=%s)", self.server_url, self._private_api_enabled, self._helper_connected)
         except Exception as exc:
             logger.error("[bluebubbles] cannot reach server at %s: %s", self.server_url, exc)
             if self.client:
@@ -178,7 +181,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     return await self._create_chat_for_handle(chat_id, chunk)
                 return SendResult(success=False, error=f'BlueBubbles chat not found for target: {chat_id}')
             payload: Dict[str, Any] = {'chatGuid': guid, 'tempGuid': f'temp-{datetime.utcnow().timestamp()}', 'message': chunk}
-            if reply_to and self._private_api_enabled:
+            if reply_to and self._private_api_enabled and self._helper_connected:
                 payload['method'] = 'private-api'
                 payload['selectedMessageGuid'] = reply_to
                 payload['partIndex'] = 0
@@ -202,6 +205,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         data = payload.get('data')
         if isinstance(data, dict):
             return data
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    return item
+        if isinstance(payload.get('message'), dict):
+            return payload.get('message')
         return payload if isinstance(payload, dict) else None
 
     @staticmethod
@@ -237,7 +246,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return web.json_response({'error': 'invalid payload'}, status=400)
 
         event_type = self._value(payload.get('type'), payload.get('event')) or ''
-        if event_type in {'message-reaction', 'reaction'}:
+        # Only process new-message events; silently acknowledge everything else
+        # (typing indicators, read receipts, reactions, group name changes, etc.)
+        _message_events = {'new-message', 'message', 'updated-message'}
+        if event_type and event_type not in _message_events:
             return web.Response(text='ok')
         record = self._extract_payload_record(payload) or {}
         is_from_me = bool(record.get('isFromMe') or record.get('fromMe') or record.get('is_from_me'))
@@ -247,7 +259,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         attachments = record.get('attachments') or []
         if not text and attachments:
             text = '(attachment)'
-        chat_guid = self._value(record.get('chatGuid'), record.get('guid'), payload.get('chatGuid'), payload.get('guid'))
+        chat_guid = self._value(
+            record.get('chatGuid'),
+            payload.get('chatGuid'),
+            record.get('chat_guid'),
+            payload.get('chat_guid'),
+            payload.get('guid'),
+        )
         chat_identifier = self._value(record.get('chatIdentifier'), record.get('identifier'), payload.get('chatIdentifier'), payload.get('identifier'))
         sender = self._value(
             record.get('handle', {}).get('address') if isinstance(record.get('handle'), dict) else None,
@@ -255,6 +273,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             record.get('from'),
             record.get('address'),
         ) or chat_identifier or chat_guid
+        if not (chat_guid or chat_identifier) and sender:
+            chat_identifier = sender
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({'error': 'missing message fields'}, status=400)
         session_chat_id = chat_guid or chat_identifier
