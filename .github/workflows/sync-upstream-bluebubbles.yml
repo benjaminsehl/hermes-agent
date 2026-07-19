@@ -1,0 +1,130 @@
+name: Sync upstream with BlueBubbles hardening
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      verify_current:
+        description: Re-run the contract gate even when fork main already contains upstream main
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: downstream-bluebubbles-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge, verify, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out tested downstream main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Fetch upstream and build candidate
+        id: candidate
+        env:
+          UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
+        run: |
+          set -euo pipefail
+          start_sha=$(git rev-parse HEAD)
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          {
+            echo "start_sha=$start_sha"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "already_current=true" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains upstream $upstream_sha"
+            exit 0
+          fi
+
+          echo "already_current=false" >> "$GITHUB_OUTPUT"
+          git config user.name "BlueBubbles downstream sync"
+          git config user.email "1060770+benjaminsehl@users.noreply.github.com"
+          git merge --no-edit upstream/main
+
+      - name: Install uv
+        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
+        run: uv python install 3.11
+
+      - name: Install locked test dependencies
+        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if uv sync --locked --python 3.11 --extra all --extra dev; then
+              exit 0
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+      - name: Verify BlueBubbles behavioral contract
+        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
+        env:
+          BASE_REF: upstream/main
+          PYTHON: .venv/bin/python
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: scripts/verify-bluebubbles-downstream.sh
+
+      - name: Advance tested fork main
+        if: steps.candidate.outputs.already_current == 'false'
+        env:
+          START_SHA: ${{ steps.candidate.outputs.start_sha }}
+        run: |
+          set -euo pipefail
+          # The lease makes a concurrent/manual main update fail rather than
+          # overwriting a commit that was not part of this candidate.
+          git push \
+            --force-with-lease="refs/heads/main:$START_SHA" \
+            origin HEAD:main
+
+      - name: Report blocked downstream sync
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          START_SHA: ${{ steps.candidate.outputs.start_sha }}
+          UPSTREAM_SHA: ${{ steps.candidate.outputs.upstream_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="BlueBubbles downstream sync blocked"
+          body=$(printf '%s\n\n- Last tested fork SHA: %s\n- Candidate upstream SHA: %s\n- Workflow run: %s\n\n%s\n' \
+            "The fail-closed BlueBubbles downstream sync did not advance main." \
+            "${START_SHA:-unknown}" \
+            "${UPSTREAM_SHA:-unknown}" \
+            "$RUN_URL" \
+            "The live update channel remains on the previous known-good commit. Port or resolve the upstream changes, rerun the contract gate, and dispatch this workflow again.")
+          issue=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
