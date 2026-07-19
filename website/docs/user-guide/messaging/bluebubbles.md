@@ -102,6 +102,7 @@ Hermes → BlueBubbles REST API → Messages.app → iMessage
 - **Inbound:** BlueBubbles sends webhook events to a local listener when new messages arrive. No polling — instant delivery.
 - **Outbound:** Hermes sends messages via the BlueBubbles REST API.
 - **Media:** Images, voice messages, videos, and documents are supported in both directions. Inbound attachments are downloaded and cached locally for the agent to process.
+- **Duplicate delivery:** Equivalent `new-message` and `updated-message` events join one bounded, metadata-only GUID reservation before ordered attachment downloads. Joins have waiter, request-wide deadline, and outcome-count limits; excess work receives retryable HTTP 503. New media preserves BlueBubbles order, is serialized against in-flight work, and is delivered once as an attachment-only enrichment.
 
 ## Environment Variables
 
@@ -136,9 +137,15 @@ display:
       quick_ack_timeout_seconds: 3      # clamped to 0.5–10 seconds
 ```
 
-If generation times out or fails, Hermes sends the fallback and continues the
-main turn. If sending the acknowledgment itself fails, the main turn still
-continues.
+One hard deadline covers generation and delivery, with a bounded slice reserved
+for the fallback and no wait for slow cancellation cleanup. Generation
+instructions use a system message, and both generated and configured text must
+match a strict pending-work grammar. Unsafe text uses the built-in fallback. If
+sending the acknowledgment itself fails, the main turn still continues.
+
+BlueBubbles send timeouts are treated as ambiguous delivery outcomes rather
+than formatting errors: the server may have delivered the bubble before its
+REST response timed out, so Hermes does not resend it as a plain-text fallback.
 
 ## Features
 

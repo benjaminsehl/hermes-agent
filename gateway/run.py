@@ -12829,13 +12829,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             turn_sidecar_notes,
         )
 
-        # Stage the collected must-deliver notes for this turn's agent run
-        # (one-shot; consumed in run_sync).  Staged AFTER the message_text
-        # early-out above so an aborted turn cannot leak its notes into the
-        # next turn's user message.
-        if turn_sidecar_notes and session_key:
-            self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
-
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -12876,6 +12869,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_sidecar_notes=turn_sidecar_notes,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18717,6 +18711,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        turn_sidecar_notes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -18735,6 +18730,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_sidecar_notes=turn_sidecar_notes,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -18746,6 +18742,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_sidecar_notes=turn_sidecar_notes,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -18867,6 +18864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        turn_sidecar_notes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -18882,9 +18880,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            proxy_context_prompt = context_prompt
+            if turn_sidecar_notes:
+                proxy_context_prompt = "\n\n".join(
+                    part
+                    for part in (
+                        context_prompt,
+                        "\n\n".join(turn_sidecar_notes),
+                    )
+                    if part
+                )
             return await self._run_agent_via_proxy(
                 message=message,
-                context_prompt=context_prompt,
+                context_prompt=proxy_context_prompt,
                 history=history,
                 source=source,
                 session_id=session_id,
@@ -20379,13 +20387,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
-            # Must-deliver notes for THIS turn ride the current user message
-            # (api_content sidecar), never the system prompt: staged by
-            # _handle_message_with_agent (auto-reset note, first-contact
-            # intro, voice-channel change).  Assigned unconditionally so a
-            # reused cached agent never replays a stale note.
+            # Must-deliver notes are passed directly by the exact turn that
+            # collected them. Assign unconditionally so a reused cached agent
+            # never replays stale context after an exception or cancellation.
             agent._gateway_turn_context_notes = "\n\n".join(
-                self._consume_pending_turn_sidecar_notes(session_key)
+                list(turn_sidecar_notes or [])
             )
 
             _bg_review_release = threading.Event()
