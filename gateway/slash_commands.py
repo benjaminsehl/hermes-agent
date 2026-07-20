@@ -1437,10 +1437,10 @@ class GatewaySlashCommandsMixin:
 
         Supports:
           /model                              — interactive picker (Telegram/Discord) or text list
-          /model <name>                       — switch model (persists by default)
+          /model <name>                       — switch model (this session only)
           /model <name> --once                — switch for the next turn only
-          /model <name> --session             — switch for this session only
-          /model <name> --global              — switch and persist (explicit)
+          /model <name> --session             — switch for this session only (explicit)
+          /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
@@ -1478,6 +1478,7 @@ class GatewaySlashCommandsMixin:
             is_global_flag,
             is_session,
             is_once=one_turn,
+            explicit_provider=explicit_provider,
         )
 
         # --refresh: bust the disk cache so the picker shows live data.
@@ -1663,11 +1664,17 @@ class GatewaySlashCommandsMixin:
                                     "Failed to persist model switch to DB: %s", exc
                                 )
 
-                        # Store model note + session override
+                        # Store model note + session override.  Use display
+                        # form (strips opaque Palantir prefix) for the user-
+                        # visible note; session-override map still gets the
+                        # full opaque ID, which is what the wire needs.
+                        from hermes_cli.model_switch import format_model_for_display
+                        _display_cur = format_model_for_display(_cur_model)
+                        _display_new = format_model_for_display(result.new_model)
                         if not hasattr(_self, "_pending_model_notes"):
                             _self._pending_model_notes = {}
                         _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
+                            f"[Note: model was just switched from {_display_cur} to {_display_new} "
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
@@ -1743,9 +1750,11 @@ class GatewaySlashCommandsMixin:
                             except Exception as e:
                                 logger.warning("Failed to persist model switch: %s", e)
 
-                        # Build confirmation text
+                        # Build confirmation text.  Use display form so opaque
+                        # Palantir IDs (ri.language-model-service..*) get
+                        # shortened to their trailing slug for the UI.
                         plabel = result.provider_label or result.target_provider
-                        lines = [t("gateway.model.switched", model=result.new_model)]
+                        lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
                         lines.append(t("gateway.model.provider_label", provider=plabel))
                         mi = result.model_info
                         from hermes_cli.model_switch import resolve_display_context_length
@@ -1939,10 +1948,13 @@ class GatewaySlashCommandsMixin:
 
             # Store a note to prepend to the next user message so the model
             # knows about the switch (avoids system messages mid-history).
+            # Display form strips opaque Palantir RID prefixes; the override
+            # map below keeps the full ID for the wire.
+            from hermes_cli.model_switch import format_model_for_display
             if not hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes = {}
             self._pending_model_notes[session_key] = (
-                f"[Note: model was just switched from {current_model} to {result.new_model} "
+                f"[Note: model was just switched from {format_model_for_display(current_model)} to {format_model_for_display(result.new_model)} "
                 f"via {result.provider_label or result.target_provider}. "
                 f"{'This override applies to the next turn only. ' if one_turn else ''}"
                 f"Adjust your self-identification accordingly.]"
@@ -2038,7 +2050,7 @@ class GatewaySlashCommandsMixin:
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider
-            lines = [t("gateway.model.switched", model=result.new_model)]
+            lines = [t("gateway.model.switched", model=format_model_for_display(result.new_model))]
             lines.append(t("gateway.model.provider_label", provider=provider_label))
 
             # Context: always resolve via the provider-aware chain so Codex OAuth,
