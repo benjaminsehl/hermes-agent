@@ -6421,7 +6421,16 @@ def _apply_model_assignment_sync(
         model_cfg = _apply_main_model_assignment(
             cfg.get("model", {}), provider, model, base_url, api_key
         )
-        if isinstance(provider_entry, dict) and provider_entry.get("api_key"):
+        # Fall back to the provider entry's stored key only when the request
+        # didn't carry one — same precedence as the base_url fill above. An
+        # unconditional overwrite silently discards a key the caller is
+        # rotating in, and model.api_key outranks the environment at client
+        # construction (#62269), so the stale key keeps authenticating.
+        if (
+            not api_key
+            and isinstance(provider_entry, dict)
+            and provider_entry.get("api_key")
+        ):
             model_cfg["api_key"] = provider_entry["api_key"]
         cfg["model"] = model_cfg
 
@@ -15011,6 +15020,12 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
                     # the GUI can offer per-capability selection.
                     row["web_backend"] = prov["web_backend"]
                     row["capabilities"] = web_provider_capabilities(prov["web_backend"])
+                if name == "tts" and prov.get("tts_provider"):
+                    # The provider key written to tts.provider on selection.
+                    # Doubles as the config section holding the provider's
+                    # voice/model settings (tts.<key>.*) so the GUI can render
+                    # those fields inline in the Capabilities panel.
+                    row["tts_provider"] = prov["tts_provider"]
                 providers.append(row)
         if name == "web":
             # Resolve the per-capability active backends exactly the way the
