@@ -17609,14 +17609,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 platform_name = source.platform.value if source.platform else ""
                 had_activity = getattr(session_entry, 'reset_had_activity', False)
-                # Suspended and restart-recovery-expired sessions always notify
-                # regardless of policy.notify — the user had an active session
-                # that was silently replaced, so they need to know they can
-                # /resume it.  Idle/daily resets respect the policy flag.
-                should_notify = reset_reason in {"suspended", "resume_pending_expired"} or (
-                    policy.notify
-                    and had_activity
-                    and platform_name not in policy.notify_exclude_platforms
+                # ``notify`` and platform exclusions are absolute user-facing
+                # preferences. Suspended/recovery-expired sessions may bypass
+                # only the activity check, never an explicit notification opt-out.
+                should_notify = self._should_send_auto_reset_notification(
+                    policy=policy,
+                    reset_reason=reset_reason,
+                    platform_name=platform_name,
+                    had_activity=had_activity,
                 )
                 if should_notify:
                     adapter = self._adapter_for_source(source)
@@ -18653,6 +18653,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+        # BlueBubbles-only pre-response acknowledgment. It is sent before the
+        # main model starts, then exposed through this turn's api_content
+        # sidecar. No synthetic role is added and the system prompt stays stable.
+        await self._maybe_send_bluebubbles_quick_ack(
+            event,
+            source,
+            persist_user_message or message_text,
+            turn_sidecar_notes,
+        )
 
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
@@ -24585,6 +24595,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         staged = state.conversation.sidecar_notes
         state.conversation.sidecar_notes = []
         return list(staged) if isinstance(staged, list) else []
+
+    async def _maybe_send_bluebubbles_quick_ack(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        message_text: str,
+        turn_sidecar_notes: List[str],
+    ) -> Optional[str]:
+        """Send the optional iMessage ack and expose it to this main turn only."""
+        if source.platform != Platform.BLUEBUBBLES:
+            return None
+        adapter = self._adapter_for_source(source)
+        maybe_send_quick_ack = getattr(adapter, "maybe_send_quick_ack", None)
+        if not callable(maybe_send_quick_ack):
+            return None
+        try:
+            ack = await cast(Any, maybe_send_quick_ack)(
+                event,
+                message_text,
+                _load_gateway_config(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("BlueBubbles quick acknowledgment failed: %s", exc)
+            return None
+        if not ack:
+            return None
+        turn_sidecar_notes.append(
+            "[System note: Before the main response, you sent the visible quick "
+            f"acknowledgment {ack!r}. Do not repeat it; continue with the user's "
+            "request. This is turn-local context, not a user-authored message.]"
+        )
+        return ack
+
+    @staticmethod
+    def _should_send_auto_reset_notification(
+        *, policy, reset_reason: str, platform_name: str, had_activity: bool
+    ) -> bool:
+        """Honor notification opt-outs for every automatic reset reason."""
+        return bool(
+            policy.notify
+            and platform_name not in policy.notify_exclude_platforms
+            and (
+                had_activity
+                or reset_reason in {"suspended", "resume_pending_expired"}
+            )
+        )
 
     def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
         """Return a ``[Voice channel now: ...]`` note when VC state changed.
