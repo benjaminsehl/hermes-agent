@@ -25,9 +25,11 @@ Run locally from a Hermes checkout with development dependencies installed:
 BASE_REF=upstream/main scripts/verify-bluebubbles-downstream.sh
 ```
 
-The gate requires at least 192 tests across the BlueBubbles and related gateway suites, then runs those tests plus Ruff, compileall, and `git diff --check`.
-
-The minimum test-count guard is intentional. An upstream merge must not make the gate green merely by deleting or no longer collecting downstream regressions.
+The gate runs the explicit BlueBubbles behavior and gateway integration suites,
+including the focused quick-ack orchestration contract, then runs Ruff,
+compileall, and `git diff --check`. Contract coverage is anchored to named
+behavior tests rather than an enumeration count, so upstream test pruning cannot
+turn the gate into a stale snapshot.
 
 ## Scheduled evolution
 

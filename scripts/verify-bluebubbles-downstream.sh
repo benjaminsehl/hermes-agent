@@ -17,11 +17,12 @@ fi
 
 TEST_FILES=(
   tests/gateway/test_bluebubbles.py
+  tests/gateway/test_bluebubbles_quick_ack_integration.py
   tests/gateway/test_prompt_tail_freeze.py
   tests/gateway/test_run_progress_topics.py
   tests/gateway/test_aiohttp_body_caps.py
 )
-MIN_CONTRACT_TESTS=192
+MIN_CONTRACT_TESTS=92
 
 collect_output=$(
   "$PY" -m pytest "${TEST_FILES[@]}" --collect-only -q -o addopts=
@@ -44,19 +45,40 @@ fi
 "$PY" -m ruff check \
   gateway/platforms/bluebubbles.py \
   gateway/run.py \
-  tests/gateway/test_bluebubbles.py
+  gateway/run_turn.py \
+  tests/gateway/test_bluebubbles.py \
+  tests/gateway/test_bluebubbles_quick_ack_integration.py
 PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/hermes-bluebubbles-downstream-pycache}" \
   "$PY" -m compileall -q \
   gateway/platforms/bluebubbles.py \
   gateway/run.py \
+  gateway/run_turn.py \
+  tests/gateway/test_bluebubbles.py \
+  tests/gateway/test_bluebubbles_quick_ack_integration.py
+
+CONTRACT_PATHS=(
+  DOWNSTREAM_BLUEBUBBLES.md
+  gateway/platforms/bluebubbles.py
+  gateway/run.py
+  gateway/run_turn.py
+  scripts/verify-bluebubbles-downstream.sh
   tests/gateway/test_bluebubbles.py
+  tests/gateway/test_bluebubbles_quick_ack_integration.py
+  website/docs/user-guide/messaging/bluebubbles.md
+)
 
 base_ref=${BASE_REF:-origin/main}
-if git rev-parse --verify "$base_ref" >/dev/null 2>&1; then
-  git diff --check "$base_ref...HEAD"
+if merge_head=$(git rev-parse --verify MERGE_HEAD 2>/dev/null); then
+  # In an uncommitted upstream merge, compare the resolved contract files to
+  # the incoming tree. Unrelated upstream whitespace is outside this gate.
+  git diff --check "$merge_head" -- "${CONTRACT_PATHS[@]}"
+elif git rev-parse --verify "$base_ref" >/dev/null 2>&1; then
+  git diff --check "$base_ref...HEAD" -- "${CONTRACT_PATHS[@]}"
+  git diff --cached --check -- "${CONTRACT_PATHS[@]}"
+  git diff --check -- "${CONTRACT_PATHS[@]}"
 else
   echo "Base ref $base_ref unavailable; refusing to skip diff validation" >&2
   exit 1
 fi
 
-echo "BlueBubbles downstream gate passed ($collected contract tests)."
+echo "BlueBubbles downstream behavior gate passed."

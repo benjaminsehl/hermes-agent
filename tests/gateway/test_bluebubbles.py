@@ -2,9 +2,12 @@
 import asyncio
 import json
 
+import httpx
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 
 
 def _make_adapter(monkeypatch, **extra):
@@ -173,6 +176,176 @@ class TestBlueBubblesWebhookParsing:
         assert record == payload["data"][0]
 
 
+class TestBlueBubblesInboundDeduplication:
+    @staticmethod
+    def _payload(message_guid, *, event_type="new-message", attachments=None):
+        return {
+            "type": event_type,
+            "data": {
+                "guid": message_guid,
+                "text": "hello",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatGuid": "iMessage;-;user@example.com",
+                "chatIdentifier": "user@example.com",
+                "attachments": attachments or [],
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_overlapping_equivalent_events_download_and_dispatch_once(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        download_started = asyncio.Event()
+        release_download = asyncio.Event()
+        handled = []
+        download_count = 0
+
+        async def download_once(*_args):
+            nonlocal download_count
+            download_count += 1
+            download_started.set()
+            await release_download.wait()
+            return "/cache/photo.jpg"
+
+        async def handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "_download_attachment", download_once)
+        monkeypatch.setattr(adapter, "handle_message", handle_message)
+        payload = self._payload(
+            "overlap-guid",
+            attachments=[{"guid": "att-1", "mimeType": "image/jpeg"}],
+        )
+
+        first = asyncio.create_task(
+            adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        )
+        await download_started.wait()
+        second = asyncio.create_task(
+            adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        )
+        await asyncio.sleep(0)
+        release_download.set()
+        responses = await asyncio.gather(first, second)
+        if adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+
+        assert [response.status for response in responses] == [200, 200]
+        assert download_count == 1
+        assert [event.message_id for event in handled] == ["overlap-guid"]
+
+    @pytest.mark.asyncio
+    async def test_updated_event_delivers_only_new_attachment_as_enrichment(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def handle_message(event):
+            handled.append(event)
+
+        async def download(_guid, _metadata):
+            return "/cache/enriched-photo.jpg"
+
+        monkeypatch.setattr(adapter, "handle_message", handle_message)
+        monkeypatch.setattr(adapter, "_download_attachment", download)
+
+        first = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._payload("enrich-guid"))
+        )
+        if adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+        updated = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._payload(
+                    "enrich-guid",
+                    event_type="updated-message",
+                    attachments=[{"guid": "att-new", "mimeType": "image/png"}],
+                )
+            )
+        )
+        if adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+
+        assert first.status == updated.status == 200
+        assert [(event.text, event.media_urls) for event in handled] == [
+            ("hello", []),
+            ("(attachment)", ["/cache/enriched-photo.jpg"]),
+        ]
+        assert handled[1].message_type.value == "photo"
+
+
+class TestBlueBubblesQuickAcknowledgment:
+    @staticmethod
+    def _config(**overrides):
+        return {
+            "display": {
+                "platforms": {
+                    "bluebubbles": {
+                        "quick_ack_enabled": True,
+                        **overrides,
+                    }
+                }
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_unsafe_model_and_config_text_use_pending_work_default(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch)
+        source = adapter.build_source(chat_id="chat", user_id="user")
+        event = MessageEvent(
+            text="Please check the deployment",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+        sent = []
+
+        async def auxiliary_call(**_kwargs):
+            return {"choices": [{"message": {"content": "Done. It is fixed."}}]}
+
+        async def send(chat_id, text):
+            sent.append((chat_id, text))
+            return SendResult(success=True)
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", auxiliary_call)
+        monkeypatch.setattr(adapter, "send", send)
+
+        ack = await adapter.maybe_send_quick_ack(
+            event,
+            event.text,
+            self._config(quick_ack_fallback="Finished already"),
+        )
+
+        assert ack == "Got it — I’m looking into that."
+        assert sent == [("chat", ack)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", ["/help", "hi", "thanks", "yes", "no"])
+    async def test_trivial_messages_do_not_generate_or_send_ack(
+        self, monkeypatch, text
+    ):
+        adapter = _make_adapter(monkeypatch)
+        source = adapter.build_source(chat_id="chat", user_id="user")
+        event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+
+        async def unexpected_call(**_kwargs):
+            raise AssertionError("trivial input must not invoke the auxiliary model")
+
+        async def unexpected_send(*_args, **_kwargs):
+            raise AssertionError("trivial input must not send a quick acknowledgment")
+
+        monkeypatch.setattr("agent.auxiliary_client.async_call_llm", unexpected_call)
+        monkeypatch.setattr(adapter, "send", unexpected_send)
+
+        assert await adapter.maybe_send_quick_ack(
+            event, event.text, self._config()
+        ) is None
+
+
 class TestBlueBubblesGuidResolution:
 
 
@@ -257,13 +430,13 @@ class TestBlueBubblesAttachmentDownload:
 
         cached_path = None
 
-        def mock_cache_image(data, ext):
+        async def mock_cache_image(data, ext):
             nonlocal cached_path
             cached_path = f"/tmp/test_image{ext}"
             return cached_path
 
         monkeypatch.setattr(
-            "gateway.platforms.bluebubbles.cache_image_from_bytes",
+            "gateway.platforms.bluebubbles.cache_image_from_bytes_async",
             mock_cache_image,
         )
 
@@ -274,18 +447,58 @@ class TestBlueBubblesAttachmentDownload:
         assert result == "/tmp/test_image.png"
 
 
+class TestBlueBubblesAttachmentSend:
+    @pytest.mark.asyncio
+    async def test_attachment_payload_is_read_before_async_upload(self, monkeypatch, tmp_path):
+        adapter = _make_adapter(monkeypatch)
+        file_path = tmp_path / "payload.bin"
+        payload = b"attachment-payload"
+        file_path.write_bytes(payload)
+
+        captured = {}
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;+;chat-guid"
+
+        class MockResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": 200, "data": {"guid": "message-guid"}}
+
+        class MockClient:
+            async def post(self, url, *, files, data, timeout):
+                captured.update(url=url, files=files, data=data, timeout=timeout)
+                return MockResponse()
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        adapter.client = MockClient()
+
+        result = await adapter._send_attachment(
+            "target", str(file_path), filename="payload.bin"
+        )
+
+        assert result.success is True
+        assert captured["files"]["attachment"] == (
+            "payload.bin",
+            payload,
+            "application/octet-stream",
+        )
+        assert captured["data"]["chatGuid"] == "iMessage;+;chat-guid"
+
+
 # ---------------------------------------------------------------------------
 # Webhook registration
 # ---------------------------------------------------------------------------
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url property normalises local hosts to explicit IPv4 loopback."""
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        assert "127.0.0.1" in adapter._webhook_url
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
 
@@ -358,6 +571,51 @@ class TestBlueBubblesWebhookRegistration:
         assert len(result) == 1
         assert result[0]["id"] == 1
 
+    @pytest.mark.asyncio
+    async def test_register_keeps_one_healthy_callback_and_removes_loopback_alias(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch, webhook_host="127.0.0.1")
+        canonical = adapter._webhook_register_url
+        alias = canonical.replace("127.0.0.1", "localhost")
+        deleted = []
+        posted = []
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+        class Client:
+            async def delete(self, url):
+                deleted.append(url)
+                return Response()
+
+        async def find_registered(_url):
+            return [
+                {
+                    "id": 7,
+                    "url": canonical,
+                    "events": ["new-message", "updated-message"],
+                },
+                {
+                    "id": 8,
+                    "url": alias,
+                    "events": ["new-message", "updated-message"],
+                },
+            ]
+
+        async def post(path, payload):
+            posted.append((path, payload))
+            return {"status": 200}
+
+        adapter.client = Client()
+        monkeypatch.setattr(adapter, "_find_registered_webhooks", find_registered)
+        monkeypatch.setattr(adapter, "_api_post", post)
+
+        assert await adapter._register_webhook() is True
+        assert len(deleted) == 1 and "/api/v1/webhook/8?" in deleted[0]
+        assert posted == []
+
 
     # -- _register_webhook --
 
@@ -382,7 +640,11 @@ class TestBlueBubblesWebhookRegistration:
         url = adapter._webhook_register_url
         adapter.client = self._mock_client(
             get_response={"status": 200, "data": [
-                {"id": 7, "url": url, "events": ["new-message"]},
+                {
+                    "id": 7,
+                    "url": url,
+                    "events": ["new-message", "updated-message"],
+                },
             ]},
         )
 
@@ -438,3 +700,87 @@ class TestBlueBubblesWebhookRegistration:
         assert len(deleted_ids) == 2
 
 
+# ---------------------------------------------------------------------------
+# Regression for #78183: httpx timeout exceptions stringify to "" which
+# defeats _is_timeout_error, causing the plain-text fallback to re-send an
+# already-delivered message (duplicate delivery).
+# ---------------------------------------------------------------------------
+
+class TestBlueBubblesTimeoutErrorNormalization:
+    """When an httpx timeout has an empty string representation, the adapter
+    must fall back to the exception type name so the base-layer timeout guard
+    can still recognise it."""
+
+    @pytest.mark.asyncio
+    async def test_send_read_timeout_produces_matchable_error(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_resolve(chat_id):
+            return "iMessage;+;chat-123"
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve)
+
+        async def fake_api_post(path, payload):
+            raise httpx.ReadTimeout("")
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("chat-1", "hello world")
+
+        assert not result.success
+        assert result.error, "error must not be empty"
+        assert BasePlatformAdapter._is_timeout_error(result.error), (
+            f"_is_timeout_error must recognise {result.error!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_write_timeout_produces_matchable_error(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_resolve(chat_id):
+            return "iMessage;+;chat-123"
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve)
+
+        async def fake_api_post(path, payload):
+            raise httpx.WriteTimeout("")
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("chat-1", "hello world")
+
+        assert not result.success
+        assert result.error
+        assert BasePlatformAdapter._is_timeout_error(result.error)
+
+    @pytest.mark.asyncio
+    async def test_create_chat_for_handle_timeout_produces_matchable_error(
+        self, monkeypatch,
+    ):
+        """Sibling call path — _create_chat_for_handle has the same
+        error=str(exc) pattern and must also preserve the exception type."""
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_api_post(path, payload):
+            raise httpx.ReadTimeout("")
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter._create_chat_for_handle("test@example.com", "hi")
+
+        assert not result.success
+        assert result.error
+        assert BasePlatformAdapter._is_timeout_error(result.error)
+
+    @pytest.mark.asyncio
+    async def test_non_empty_error_string_is_unchanged(self, monkeypatch):
+        """A normal exception with a message must keep its original text."""
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_resolve(chat_id):
+            return "iMessage;+;chat-123"
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve)
+
+        async def fake_api_post(path, payload):
+            raise RuntimeError("Server error '500 Internal Server Error'")
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("chat-1", "hello world")
+
+        assert not result.success
+        assert "500 Internal Server Error" in (result.error or "")

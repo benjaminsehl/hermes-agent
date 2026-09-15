@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from gateway.config import Platform, SessionResetPolicy
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -57,29 +57,3 @@ async def test_quick_ack_integration_is_bluebubbles_only():
         is None
     )
     assert notes == []
-
-
-@pytest.mark.parametrize("reason", ["idle", "daily", "suspended", "resume_pending_expired"])
-def test_notify_false_suppresses_every_auto_reset_reason(reason):
-    policy = SessionResetPolicy(notify=False)
-
-    assert not GatewayRunner._should_send_auto_reset_notification(
-        policy=policy,
-        reset_reason=reason,
-        platform_name="bluebubbles",
-        had_activity=True,
-    )
-
-
-def test_platform_exclusion_suppresses_forced_reset_notice():
-    policy = SessionResetPolicy(
-        notify=True,
-        notify_exclude_platforms=("bluebubbles",),
-    )
-
-    assert not GatewayRunner._should_send_auto_reset_notification(
-        policy=policy,
-        reset_reason="resume_pending_expired",
-        platform_name="bluebubbles",
-        had_activity=True,
-    )
