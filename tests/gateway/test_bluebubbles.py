@@ -211,6 +211,7 @@ class TestBlueBubblesInboundDeduplication:
 
         async def handle_message(event):
             handled.append(event)
+            event._gateway_accepted = True
 
         monkeypatch.setattr(adapter, "_download_attachment", download_once)
         monkeypatch.setattr(adapter, "handle_message", handle_message)
@@ -245,6 +246,7 @@ class TestBlueBubblesInboundDeduplication:
 
         async def handle_message(event):
             handled.append(event)
+            event._gateway_accepted = True
 
         async def download(_guid, _metadata):
             return "/cache/enriched-photo.jpg"

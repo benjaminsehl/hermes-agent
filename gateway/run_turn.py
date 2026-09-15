@@ -1354,6 +1354,8 @@ class GatewayTurnMixin:
         source: SessionSource,
         message_text: str,
         turn_sidecar_notes: List[str],
+        *,
+        admission_check: Optional[Callable[[], bool]] = None,
     ) -> Optional[str]:
         """Send the optional iMessage ack and expose it to this main turn only."""
         if source.platform != Platform.BLUEBUBBLES:
@@ -1365,24 +1367,35 @@ class GatewayTurnMixin:
         try:
             from gateway.run import _load_gateway_config
 
-            ack = await maybe_send_quick_ack(
+            outcome = await maybe_send_quick_ack(
                 event,
                 message_text,
                 _load_gateway_config(),
+                admission_check=admission_check,
             )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("BlueBubbles quick acknowledgment failed: %s", exc)
             return None
-        if not ack:
+        if not outcome:
             return None
-        turn_sidecar_notes.append(
-            "[System note: Before the main response, you sent the visible quick "
-            f"acknowledgment {ack!r}. Do not repeat it; continue with the user's "
-            "request. This is turn-local context, not a user-authored message.]"
-        )
-        return ack
+        ack = getattr(outcome, "text", outcome)
+        delivery_state = getattr(outcome, "delivery_state", "sent")
+        if delivery_state == "potentially_sent":
+            turn_sidecar_notes.append(
+                "[System note: Before the main response, the outbound quick "
+                f"acknowledgment {ack!r} became potentially visible. Treat it as "
+                "visible. Do not repeat it; continue with the user's request. "
+                "This is turn-local context, not a user-authored message.]"
+            )
+        else:
+            turn_sidecar_notes.append(
+                "[System note: Before the main response, you sent the visible quick "
+                f"acknowledgment {ack!r}. Do not repeat it; continue with the user's "
+                "request. This is turn-local context, not a user-authored message.]"
+            )
+        return outcome
 
     async def _hmwa_stop_typing_for_turn(self, event, source):
         """Stop the typing indicator (never raises). Slack AI status is scoped to a thread/
@@ -1912,6 +1925,7 @@ class GatewayTurnMixin:
         persist_user_display_kind: Optional[str]
         persistence_session_id: Optional[str] = None
         persistence_owner: Optional[str] = None
+        turn_sidecar_notes: List[str] = dataclasses.field(default_factory=list)
 
     async def _hmwa_prepare_turn(self, event, source, session_entry, session_key, _quick_key, run_generation):
         """Everything between session resolution and the agent run: session open, task-local env,
@@ -1985,21 +1999,6 @@ class GatewayTurnMixin:
             self._hmwa_apply_message_timestamp(event, message_text)
         )
 
-        # BlueBubbles-only pre-response acknowledgment. It runs after inbound
-        # normalization and before the main model, and its note rides the
-        # turn-local api_content sidecar without mutating conversation roles.
-        await self._maybe_send_bluebubbles_quick_ack(
-            event,
-            source,
-            persist_user_message or message_text,
-            turn_sidecar_notes,
-        )
-
-        # Stage the notes (one-shot; consumed in run_sync) AFTER the early-out so an aborted turn
-        # cannot leak them into the next turn.
-        if turn_sidecar_notes and session_key:
-            self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
-
         # Bind this run generation to the adapter so deferred post-delivery callbacks are released
         # by the run that registered them.
         self._bind_adapter_run_generation(self._adapter_for_source(source), session_key, run_generation)
@@ -2012,7 +2011,7 @@ class GatewayTurnMixin:
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
-            persist_user_display_kind, session_entry.session_id, owner,
+            persist_user_display_kind, session_entry.session_id, owner, turn_sidecar_notes,
         ), _session_env_tokens
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
@@ -2055,6 +2054,40 @@ class GatewayTurnMixin:
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
+            try:
+                generation_is_tracked = self._peek_session_state(_quick_key) is not None
+            except Exception:
+                generation_is_tracked = False
+            if generation_is_tracked and not self._is_session_run_current(
+                _quick_key, run_generation
+            ):
+                return
+
+            def final_admission_is_current() -> bool:
+                return (
+                    (
+                        not generation_is_tracked
+                        or self._is_session_run_current(_quick_key, run_generation)
+                    )
+                    and heartbeat_owner_is_current(self, event, session_key)
+                )
+
+            # This is the last external send before model execution. The adapter
+            # rechecks the same admission immediately before its send so a turn
+            # superseded during auxiliary generation cannot leave an orphan ack.
+            await self._maybe_send_bluebubbles_quick_ack(
+                event,
+                source,
+                prepared.persist_user_message or message_text,
+                prepared.turn_sidecar_notes,
+                admission_check=final_admission_is_current,
+            )
+            if not final_admission_is_current():
+                return
+            if prepared.turn_sidecar_notes and session_key:
+                self._set_pending_turn_sidecar_notes(
+                    session_key, prepared.turn_sidecar_notes
+                )
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and

@@ -12,26 +12,33 @@ on:
         default: true
 
 permissions:
-  contents: write
-  issues: write
+  contents: read
 
 concurrency:
   group: downstream-bluebubbles-sync
   cancel-in-progress: false
 
 jobs:
-  sync:
-    name: Merge, verify, and publish
+  prepare:
+    name: Prepare immutable candidate
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      already_current: ${{ steps.candidate.outputs.already_current }}
+      start_sha: ${{ steps.candidate.outputs.start_sha }}
+      upstream_sha: ${{ steps.candidate.outputs.upstream_sha }}
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
     steps:
-      - name: Check out tested downstream main
+      - name: Check out downstream main without credentials
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           ref: main
+          persist-credentials: false
 
-      - name: Fetch upstream and build candidate
+      - name: Build candidate without executing repository code
         id: candidate
         env:
           UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
@@ -41,37 +48,84 @@ jobs:
           git remote add upstream "$UPSTREAM_URL"
           git fetch --no-tags upstream main
           upstream_sha=$(git rev-parse upstream/main)
+          already_current=false
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            already_current=true
+            echo "Fork main already contains upstream $upstream_sha"
+          else
+            git config user.name "BlueBubbles downstream sync"
+            git config user.email "1060770+benjaminsehl@users.noreply.github.com"
+            git merge --no-edit upstream/main
+          fi
+          candidate_sha=$(git rev-parse HEAD)
           {
+            echo "already_current=$already_current"
             echo "start_sha=$start_sha"
             echo "upstream_sha=$upstream_sha"
+            echo "candidate_sha=$candidate_sha"
           } >> "$GITHUB_OUTPUT"
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "already_current=true" >> "$GITHUB_OUTPUT"
-            echo "Fork main already contains upstream $upstream_sha"
-            exit 0
-          fi
+          mkdir candidate-artifact
+          git bundle create candidate-artifact/candidate.bundle HEAD
+          printf '%s\n%s\n%s\n' \
+            "$start_sha" "$upstream_sha" "$candidate_sha" \
+            > candidate-artifact/candidate-shas
 
-          echo "already_current=false" >> "$GITHUB_OUTPUT"
-          git config user.name "BlueBubbles downstream sync"
-          git config user.email "1060770+benjaminsehl@users.noreply.github.com"
-          git merge --no-edit upstream/main
+      - name: Upload immutable candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bluebubbles-sync-candidate
+          path: candidate-artifact
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify candidate without write authority
+    needs: prepare
+    if: >-
+      ${{ needs.prepare.outputs.already_current == 'false' ||
+          (github.event_name == 'workflow_dispatch' && inputs.verify_current) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Download prepared candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bluebubbles-sync-candidate
+          path: candidate-artifact
+
+      - name: Materialize the exact candidate
+        run: |
+          set -euo pipefail
+          readarray -t shas < candidate-artifact/candidate-shas
+          start_sha=${shas[0]}
+          upstream_sha=${shas[1]}
+          candidate_sha=${shas[2]}
+          test "$start_sha" = "${{ needs.prepare.outputs.start_sha }}"
+          test "$upstream_sha" = "${{ needs.prepare.outputs.upstream_sha }}"
+          test "$candidate_sha" = "${{ needs.prepare.outputs.candidate_sha }}"
+          git bundle verify candidate-artifact/candidate.bundle
+          git clone candidate-artifact/candidate.bundle verified-tree
+          test "$(git -C verified-tree rev-parse HEAD)" = "$candidate_sha"
+          git -C verified-tree merge-base --is-ancestor "$start_sha" "$candidate_sha"
+          git -C verified-tree merge-base --is-ancestor "$upstream_sha" "$candidate_sha"
+          git -C verified-tree branch upstream-main "$upstream_sha"
 
       - name: Install uv
-        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
+            verified-tree/pyproject.toml
+            verified-tree/uv.lock
 
       - name: Set up Python 3.11
-        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
         run: uv python install 3.11
 
       - name: Install locked test dependencies
-        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
+        working-directory: verified-tree
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
@@ -85,41 +139,87 @@ jobs:
           done
 
       - name: Verify BlueBubbles behavioral contract
-        if: steps.candidate.outputs.already_current == 'false' || (github.event_name == 'workflow_dispatch' && inputs.verify_current)
+        working-directory: verified-tree
         env:
-          BASE_REF: upstream/main
+          BASE_REF: upstream-main
           PYTHON: .venv/bin/python
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
         run: scripts/verify-bluebubbles-downstream.sh
 
-      - name: Advance tested fork main
-        if: steps.candidate.outputs.already_current == 'false'
-        env:
-          START_SHA: ${{ steps.candidate.outputs.start_sha }}
-        run: |
-          set -euo pipefail
-          # The lease makes a concurrent/manual main update fail rather than
-          # overwriting a commit that was not part of this candidate.
-          git push \
-            --force-with-lease="refs/heads/main:$START_SHA" \
-            origin HEAD:main
+  publish:
+    name: Publish exact verified candidate
+    needs: [prepare, verify]
+    if: >-
+      ${{ always() && needs.prepare.result == 'success' &&
+          needs.verify.result == 'success' &&
+          needs.prepare.outputs.already_current == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bluebubbles-sync-candidate
+          path: candidate-artifact
 
-      - name: Report blocked downstream sync
-        if: failure()
+      - name: Push only the verified SHA with an exact lease
         env:
           GH_TOKEN: ${{ github.token }}
-          START_SHA: ${{ steps.candidate.outputs.start_sha }}
-          UPSTREAM_SHA: ${{ steps.candidate.outputs.upstream_sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          readarray -t shas < candidate-artifact/candidate-shas
+          start_sha=${shas[0]}
+          upstream_sha=${shas[1]}
+          candidate_sha=${shas[2]}
+          test "$start_sha" = "${{ needs.prepare.outputs.start_sha }}"
+          test "$upstream_sha" = "${{ needs.prepare.outputs.upstream_sha }}"
+          test "$candidate_sha" = "${{ needs.prepare.outputs.candidate_sha }}"
+          git bundle verify candidate-artifact/candidate.bundle
+          git clone candidate-artifact/candidate.bundle publish-tree
+          test "$(git -C publish-tree rev-parse HEAD)" = "$candidate_sha"
+          git -C publish-tree merge-base --is-ancestor "$start_sha" "$candidate_sha"
+          git -C publish-tree merge-base --is-ancestor "$upstream_sha" "$candidate_sha"
+
+          askpass="$RUNNER_TEMP/bluebubbles-sync-askpass"
+          printf '#!/bin/sh\nprintf "%%s\\n" "$GH_TOKEN"\n' > "$askpass"
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          git -C publish-tree remote set-url origin "https://x-access-token@github.com/$REPOSITORY.git"
+          git -C publish-tree push \
+            --force-with-lease="refs/heads/main:$start_sha" \
+            origin "$candidate_sha:refs/heads/main"
+
+  report:
+    name: Report blocked downstream sync
+    needs: [prepare, verify, publish]
+    if: >-
+      ${{ always() &&
+          (needs.prepare.result == 'failure' ||
+           needs.verify.result == 'failure' ||
+           needs.publish.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the blocked-sync issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          START_SHA: ${{ needs.prepare.outputs.start_sha }}
+          UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+          CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           title="BlueBubbles downstream sync blocked"
-          body=$(printf '%s\n\n- Last tested fork SHA: %s\n- Candidate upstream SHA: %s\n- Workflow run: %s\n\n%s\n' \
+          body=$(printf '%s\n\n- Last tested fork SHA: %s\n- Candidate upstream SHA: %s\n- Candidate merge SHA: %s\n- Workflow run: %s\n\n%s\n' \
             "The fail-closed BlueBubbles downstream sync did not advance main." \
             "${START_SHA:-unknown}" \
             "${UPSTREAM_SHA:-unknown}" \
+            "${CANDIDATE_SHA:-unknown}" \
             "$RUN_URL" \
             "The live update channel remains on the previous known-good commit. Port or resolve the upstream changes, rerun the contract gate, and dispatch this workflow again.")
           issue=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')

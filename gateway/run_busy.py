@@ -540,7 +540,7 @@ class GatewayBusySessionMixin:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
 
-    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
+    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> bool:
         """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
         from gateway.run import _build_media_placeholder
         try:
@@ -553,8 +553,9 @@ class GatewayBusySessionMixin:
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
             running_agent.interrupt(_interrupt_text)
+            return True
         except Exception:
-            pass  # don't let interrupt failure block the ack
+            return False
 
     def _busy_steer_ack_enabled(self, event: MessageEvent, session_key: str) -> bool:
         # Some mobile chat setups want silent steering — keep the behavior, drop the bubble.
@@ -682,8 +683,10 @@ class GatewayBusySessionMixin:
         effective_mode = self._effective_busy_input_mode(event.source)
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
+            event._gateway_accepted = True
             return True
         if await self._route_plaintext_approval_while_busy(event, session_key):
+            event._gateway_accepted = True
             return True
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -705,6 +708,8 @@ class GatewayBusySessionMixin:
         running_agent = _busy_state.turn.agent if _busy_state else None
         _steer = await self._resolve_busy_steer_or_redirect(event, session_key, effective_mode, running_agent)
         effective_mode, redirected = _steer.effective_mode, _steer.redirected
+        if _steer.steered or redirected:
+            event._gateway_accepted = True
         # Queue as the next turn — skipped after a successful steer/redirect (the text is already in
         # the run and must NOT replay). FIFO gives each text its own turn (raw merge would join them).
         if not _steer.steered and not redirected:
@@ -725,7 +730,16 @@ class GatewayBusySessionMixin:
             effective_mode == "interrupt" and not redirected
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
-            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
+            interrupted = await self._interrupt_running_agent_for_busy_event(
+                event, adapter, running_agent
+            )
+            if interrupted:
+                event._gateway_accepted = True
+
+        # A capped FIFO is a real refusal, not a successful admission. Leave the
+        # receipt false so durable transports retry after queue capacity returns.
+        if event._gateway_accepted is not True:
+            return True
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.

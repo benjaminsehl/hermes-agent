@@ -35,7 +35,9 @@ async def test_bluebubbles_quick_ack_is_sent_and_added_to_turn_sidecar():
         )
 
     assert ack == "I'm checking that now."
-    adapter.maybe_send_quick_ack.assert_awaited_once_with(event, event.text, config)
+    adapter.maybe_send_quick_ack.assert_awaited_once_with(
+        event, event.text, config, admission_check=None
+    )
     assert len(notes) == 1
     assert "visible quick acknowledgment" in notes[0]
     assert "Do not repeat it" in notes[0]
